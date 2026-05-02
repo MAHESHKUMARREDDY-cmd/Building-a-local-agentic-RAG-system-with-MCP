@@ -1,0 +1,17 @@
+# 1. Create the repo on github.com first (click New Repository, name it agentic-rag-mcp)
+
+# 2. Clone it locally
+git clone https://github.com/YOUR_USERNAME/agentic-rag-mcp.git
+cd agentic-rag-mcp
+
+# 3. Create the folder structure
+mkdir docs
+
+# 4. Create each file above (copy-paste the content into each file)
+# README.md, .env.example, .gitignore, requirements.txt, docs/setup.md
+# Then copy your agent.py, ingest.py, mcp.json into the same folder
+
+# 5. Stage, commit, push
+git add .
+git commit -m "feat: initial agentic RAG system with MCP, LangGraph, and CoVe"
+git push origin main
