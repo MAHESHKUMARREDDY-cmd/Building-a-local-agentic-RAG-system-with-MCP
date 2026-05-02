@@ -1,0 +1,47 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/home/user/knowledge-base",
+        "/home/user/documents"
+      ],
+      "env": {},
+      "description": "Serves local Markdown and PDF files for private knowledge retrieval",
+      "capabilities": ["resources", "tools"]
+    },
+    "sqlite": {
+      "command": "uvx",
+      "args": [
+        "mcp-server-sqlite",
+        "--db-path",
+        "/home/user/data/knowledge.db"
+      ],
+      "env": {},
+      "description": "Structured data retrieval: product tables, logs, metadata registers",
+      "capabilities": ["resources", "tools"]
+    },
+    "searxng": {
+      "command": "python",
+      "args": [
+        "-m",
+        "mcp_server_searxng"
+      ],
+      "env": {
+        "SEARXNG_BASE_URL": "http://localhost:8888",
+        "SEARXNG_ENGINES": "google,bing,duckduckgo,wikipedia",
+        "SEARXNG_MAX_RESULTS": "10",
+        "SEARXNG_SAFE_SEARCH": "1"
+      },
+      "description": "Real-time web grounding via self-hosted SearXNG — zero API keys",
+      "capabilities": ["tools"]
+    }
+  },
+  "globalSettings": {
+    "timeout_seconds": 30,
+    "max_retries": 2,
+    "log_level": "INFO"
+  }
+}
