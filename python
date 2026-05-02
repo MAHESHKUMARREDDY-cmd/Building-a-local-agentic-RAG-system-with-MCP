@@ -1,0 +1,326 @@
+"""
+Agentic RAG — Hybrid MCP Orchestration with CoVe Critique Loop
+Stack: LangGraph + Ollama + FlashRank + ChromaDB
+"""
+
+from __future__ import annotations
+import json
+from typing import TypedDict, Annotated, Literal
+from langgraph.graph import StateGraph, END
+from langgraph.graph.message import add_messages
+from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain_chroma import Chroma
+from langchain.tools.retriever import create_retriever_tool
+from flashrank import Ranker, RerankRequest
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+import asyncio
+
+# ── 1. Models (100% local) ────────────────────────────────────────────────────
+
+LLM = ChatOllama(model="llama3.1:8b", temperature=0.1, num_ctx=8192)
+EMBEDDER = OllamaEmbeddings(model="nomic-embed-text")
+RANKER = Ranker(model_name="ms-marco-MiniLM-L-12-v2", cache_dir="/tmp/flashrank")
+
+# ── 2. Vector store (ChromaDB, local) ────────────────────────────────────────
+
+VECTORSTORE = Chroma(
+    collection_name="private_kb",
+    embedding_function=EMBEDDER,
+    persist_directory="./chroma_db",
+)
+LOCAL_RETRIEVER = VECTORSTORE.as_retriever(
+    search_type="mmr",
+    search_kwargs={"k": 20, "fetch_k": 50},
+)
+
+# ── 3. Graph state schema ─────────────────────────────────────────────────────
+
+class AgentState(TypedDict):
+    query: str
+    intent: Literal["local_only", "web_only", "hybrid"]
+    local_chunks: list[dict]       # {text, metadata}
+    web_chunks: list[dict]         # {text, url, timestamp}
+    ranked_chunks: list[dict]      # merged + re-ranked
+    draft_answer: str
+    verification_report: dict      # {claims, verdicts, conflicts}
+    conflict_detected: bool
+    cove_rationale: str
+    final_answer: str
+    messages: Annotated[list, add_messages]
+
+# ── 4. Node: Intent classifier ────────────────────────────────────────────────
+
+INTENT_PROMPT = """Classify the following query into exactly one routing strategy.
+
+Query: {query}
+
+Rules:
+- "local_only"  → query is entirely about internal data, personal files, or company knowledge
+- "web_only"    → query is entirely about current events, live prices, or public news
+- "hybrid"      → query requires BOTH private context AND live web information
+
+Respond with ONLY a JSON object: {{"intent": "<strategy>", "local_subquery": "...", "web_subquery": "..."}}"""
+
+def classify_intent(state: AgentState) -> AgentState:
+    prompt = INTENT_PROMPT.format(query=state["query"])
+    raw = LLM.invoke(prompt).content
+    data = json.loads(raw)
+    return {
+        **state,
+        "intent": data["intent"],
+        # Attach refined sub-queries for each lane
+        "query": state["query"],
+        "_local_subquery": data.get("local_subquery", state["query"]),
+        "_web_subquery": data.get("web_subquery", state["query"]),
+    }
+
+# ── 5. Node: Local MCP retrieval ─────────────────────────────────────────────
+
+async def fetch_local_mcp(subquery: str) -> list[dict]:
+    """Pull chunks from Filesystem MCP + SQLite MCP servers."""
+    chunks = []
+    server_params = StdioServerParameters(
+        command="npx",
+        args=["-y", "@modelcontextprotocol/server-filesystem",
+              "/home/user/knowledge-base"],
+    )
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.call_tool(
+                "search_files",
+                arguments={"query": subquery, "max_results": 20}
+            )
+            for item in result.content:
+                chunks.append({
+                    "text": item.text,
+                    "metadata": {
+                        "source": "local_filesystem",
+                        "path": item.uri,
+                        "type": "private"
+                    }
+                })
+
+    # Also hit ChromaDB for pre-embedded vectors
+    docs = LOCAL_RETRIEVER.invoke(subquery)
+    for doc in docs:
+        chunks.append({
+            "text": doc.page_content,
+            "metadata": {**doc.metadata, "source": "chroma_local", "type": "private"}
+        })
+    return chunks
+
+def retrieve_local(state: AgentState) -> AgentState:
+    if state["intent"] == "web_only":
+        return {**state, "local_chunks": []}
+    chunks = asyncio.run(fetch_local_mcp(state.get("_local_subquery", state["query"])))
+    return {**state, "local_chunks": chunks}
+
+# ── 6. Node: Web MCP retrieval (SearXNG) ─────────────────────────────────────
+
+async def fetch_web_mcp(subquery: str) -> list[dict]:
+    """Pull live results from self-hosted SearXNG via MCP."""
+    chunks = []
+    server_params = StdioServerParameters(
+        command="python", args=["-m", "mcp_server_searxng"],
+        env={"SEARXNG_BASE_URL": "http://localhost:8888"}
+    )
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.call_tool(
+                "web_search",
+                arguments={"query": subquery, "max_results": 10}
+            )
+            for item in result.content:
+                chunks.append({
+                    "text": item.text,
+                    "metadata": {
+                        "source": "searxng_web",
+                        "url": item.uri,
+                        "timestamp": item.mimeType,   # carries date header
+                        "type": "public_web"
+                    }
+                })
+    return chunks
+
+def retrieve_web(state: AgentState) -> AgentState:
+    if state["intent"] == "local_only":
+        return {**state, "web_chunks": []}
+    chunks = asyncio.run(fetch_web_mcp(state.get("_web_subquery", state["query"])))
+    return {**state, "web_chunks": chunks}
+
+# ── 7. Node: FlashRank re-ranker ──────────────────────────────────────────────
+
+def rerank_chunks(state: AgentState) -> AgentState:
+    """Merge local + web chunks, re-rank against original query with FlashRank."""
+    all_chunks = state["local_chunks"] + state["web_chunks"]
+    if not all_chunks:
+        return {**state, "ranked_chunks": []}
+
+    passages = [
+        {"id": i, "text": c["text"], "meta": c["metadata"]}
+        for i, c in enumerate(all_chunks)
+    ]
+    rerank_request = RerankRequest(query=state["query"], passages=passages)
+    results = RANKER.rerank(rerank_request)
+
+    # Keep top 8, attach original metadata
+    ranked = []
+    for r in results[:8]:
+        original = all_chunks[r["id"]]
+        ranked.append({
+            "text": r["text"],
+            "score": r["score"],
+            "metadata": original["metadata"],
+        })
+    return {**state, "ranked_chunks": ranked}
+
+# ── 8. Node: Synthesis ────────────────────────────────────────────────────────
+
+SYNTHESIS_PROMPT = """You are a precise research assistant. Answer the query using ONLY the sources below.
+Cite each fact with its source tag [S1], [S2], etc.
+
+QUERY: {query}
+
+SOURCES:
+{sources}
+
+Requirements:
+- Ground every claim in a source
+- Note the source type (private_file / public_web) per claim
+- If sources conflict, flag it with ⚠ CONFLICT
+"""
+
+def synthesize(state: AgentState) -> AgentState:
+    sources_text = "\n\n".join([
+        f"[S{i+1}] ({c['metadata']['source']}) {c['text']}"
+        for i, c in enumerate(state["ranked_chunks"])
+    ])
+    prompt = SYNTHESIS_PROMPT.format(query=state["query"], sources=sources_text)
+    draft = LLM.invoke(prompt).content
+    return {**state, "draft_answer": draft}
+
+# ── 9. Node: Critique (Chain-of-Verification) ─────────────────────────────────
+
+COVE_PROMPT = """You are a fact-checking critic. Evaluate this draft answer against the sources.
+
+DRAFT:
+{draft}
+
+ORIGINAL SOURCES:
+{sources}
+
+Step 1 — Extract every atomic factual claim from the draft.
+Step 2 — For each claim, write a verification question.
+Step 3 — Answer each verification question using ONLY the sources.
+Step 4 — Compare: does the draft claim match the source answer?
+Step 5 — Flag any claim where local_file data contradicts public_web data as CONFLICT.
+
+Respond as JSON:
+{{
+  "claims": [
+    {{"claim": "...", "verification_q": "...", "source_answer": "...", "verdict": "PASS|FAIL|CONFLICT"}}
+  ],
+  "overall": "PASS|FAIL|CONFLICT",
+  "conflict_summary": "..."
+}}"""
+
+def critique(state: AgentState) -> AgentState:
+    sources_text = "\n\n".join([
+        f"[S{i+1}] ({c['metadata']['source']}) {c['text']}"
+        for i, c in enumerate(state["ranked_chunks"])
+    ])
+    prompt = COVE_PROMPT.format(draft=state["draft_answer"], sources=sources_text)
+    raw = LLM.invoke(prompt).content
+    # Strip markdown fences if present
+    raw = raw.strip().removeprefix("```json").removesuffix("```").strip()
+    report = json.loads(raw)
+    conflict = report.get("overall") in ("FAIL", "CONFLICT")
+    return {**state, "verification_report": report, "conflict_detected": conflict}
+
+# ── 10. Node: CoVe conflict resolution ───────────────────────────────────────
+
+RESOLUTION_PROMPT = """You must arbitrate a conflict between private file data and live web data.
+
+CONFLICT SUMMARY: {conflict_summary}
+
+ARBITRATION RULES (apply in order):
+1. For company-specific policy facts → private file wins
+2. For current-date facts (prices, regulations, news) → web source wins if timestamped within 7 days
+3. For historical facts → higher-citation source wins
+4. When still ambiguous → present both perspectives with caveats
+
+Generate a corrected, conflict-resolved answer. Explain your arbitration reasoning.
+Original query: {query}
+"""
+
+def resolve_conflict(state: AgentState) -> AgentState:
+    prompt = RESOLUTION_PROMPT.format(
+        conflict_summary=state["verification_report"].get("conflict_summary", ""),
+        query=state["query"]
+    )
+    rationale = LLM.invoke(prompt).content
+    return {**state, "cove_rationale": rationale, "draft_answer": rationale}
+
+# ── 11. Node: Final output ────────────────────────────────────────────────────
+
+def emit_output(state: AgentState) -> AgentState:
+    answer = state["draft_answer"]
+    if state.get("cove_rationale"):
+        answer = f"{answer}\n\n---\n⚖ **Arbitration applied:** {state['cove_rationale'][:300]}…"
+    return {**state, "final_answer": answer}
+
+# ── 12. Router ────────────────────────────────────────────────────────────────
+
+def route_after_critique(state: AgentState) -> Literal["resolve_conflict", "emit_output"]:
+    return "resolve_conflict" if state["conflict_detected"] else "emit_output"
+
+# ── 13. Build the cyclic LangGraph ───────────────────────────────────────────
+
+def build_graph() -> StateGraph:
+    graph = StateGraph(AgentState)
+
+    graph.add_node("classify_intent", classify_intent)
+    graph.add_node("retrieve_local", retrieve_local)
+    graph.add_node("retrieve_web", retrieve_web)
+    graph.add_node("rerank_chunks", rerank_chunks)
+    graph.add_node("synthesize", synthesize)
+    graph.add_node("critique", critique)
+    graph.add_node("resolve_conflict", resolve_conflict)
+    graph.add_node("emit_output", emit_output)
+
+    graph.set_entry_point("classify_intent")
+    graph.add_edge("classify_intent", "retrieve_local")
+    graph.add_edge("classify_intent", "retrieve_web")
+    graph.add_edge("retrieve_local", "rerank_chunks")
+    graph.add_edge("retrieve_web", "rerank_chunks")
+    graph.add_edge("rerank_chunks", "synthesize")
+    graph.add_edge("synthesize", "critique")
+
+    # Cyclic: conflict → re-synthesize after resolution
+    graph.add_conditional_edges(
+        "critique",
+        route_after_critique,
+        {"resolve_conflict": "resolve_conflict", "emit_output": "emit_output"},
+    )
+    graph.add_edge("resolve_conflict", "synthesize")   # ← THE CYCLE
+    graph.add_edge("emit_output", END)
+
+    return graph.compile()
+
+
+# ── 14. Entry point ───────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    agent = build_graph()
+    result = agent.invoke({
+        "query": "Summarize our Q3 procurement policy and cross-check it against today's EU supply chain regulations.",
+        "intent": "hybrid",
+        "local_chunks": [], "web_chunks": [], "ranked_chunks": [],
+        "draft_answer": "", "verification_report": {},
+        "conflict_detected": False, "cove_rationale": "",
+        "final_answer": "", "messages": [],
+    })
+    print(result["final_answer"])
